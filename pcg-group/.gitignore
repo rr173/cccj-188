@@ -1,0 +1,22 @@
+# Generated sources and runtime databases are disposable artifacts, never commit them.
+data/*
+!data/.gitkeep
+/tmp/
+*.db
+*.db-wal
+*.db-shm
+*.coordlock
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Worker / coordinator run logs
+*.log
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/

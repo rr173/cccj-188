@@ -415,6 +415,8 @@ def approve(conn: sqlite3.Connection, correction_id: str,
                 (state["active_version"], pid, offset, payload, now_ms,
                  new_rev))
         else:
+            payload_json = json.dumps(payload, sort_keys=True,
+                                      separators=(",", ":"), ensure_ascii=False)
             conn.execute(
                 "INSERT INTO rule_results(version_id,partition_id,offset,"
                 "status,result_json,error_json,computed_at,source_revision) "
@@ -425,9 +427,19 @@ def approve(conn: sqlite3.Connection, correction_id: str,
                 "computed_at=excluded.computed_at,"
                 "source_revision=excluded.source_revision",
                 (state["active_version"], pid, offset,
-                 json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                            ensure_ascii=False),
+                 payload_json,
                  now_ms, new_rev))
+        # the delivery event for the corrected official state is part of the
+        # SAME approval transaction: a revision without its event (or vice
+        # versa) cannot be committed. Pending proposals never emit anything.
+        from .delivery_store import emit_correction_event
+        emit_correction_event(
+            conn, partition=pid, offset=offset, new_revision=new_rev,
+            status=status,
+            payload=payload if status == "ok" else payload_json,
+            active_version=state["active_version"],
+            publish_seq=state["publish_seq"], correction_id=correction_id,
+            now_ms=now_ms)
         seq = _bump_correction_seq(conn)
         conn.execute(
             "UPDATE correction_proposals SET state='applied', decided_at=?, "

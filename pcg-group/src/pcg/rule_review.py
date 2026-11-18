@@ -382,9 +382,18 @@ def activate(conn: sqlite3.Connection, token: str, now_ms: int,
         conn.execute(
             "INSERT INTO rule_publishes(seq,version_id,at_ms,reason) "
             "VALUES(?,?,?,?)", (new_seq, candidate_id, now_ms, reason))
+        # the whole historical recompute set becomes visible as ONE logical
+        # publish batch in the delivery stream, inside this same transaction.
+        # Candidate rows prepared by earlier recomputes stay invisible until
+        # this commit; a crash before it leaves both the pointer and the
+        # delivery log untouched, so a partial "new version" can never be read.
+        from .delivery_store import emit_publish_events
+        emitted = emit_publish_events(
+            conn, candidate_id=candidate_id, vector=vector, new_seq=new_seq,
+            review_token=token, now_ms=now_ms)
         conn.execute("COMMIT")
         return {"action": "switched", "version_id": candidate_id,
-                "publish_seq": new_seq}
+                "publish_seq": new_seq, "delivery_events": emitted}
     except ActivationError:
         raise
     except Exception:

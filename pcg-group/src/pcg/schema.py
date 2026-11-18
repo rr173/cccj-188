@@ -299,4 +299,90 @@ CREATE INDEX IF NOT EXISTS idx_corrections_po
   ON source_corrections(partition_id, offset);
 CREATE INDEX IF NOT EXISTS idx_proposals_state
   ON correction_proposals(state);
+
+-- ===========================================================================
+-- Durable change delivery (see docs/delivery.md and pcg.delivery_*).
+--
+-- An append-only, durable change log that lets any number of independent
+-- named consumers start from one consistent snapshot and then receive only
+-- new/changed official records.  Every producer transaction (ingest commit,
+-- correction approval, rule activation) writes its delivery events in the
+-- SAME transaction as the business change: there is never a committed state
+-- with a missing delivery event or a delivery event without its state.
+--
+--   * delivery_batches     - one row per atomic producer transaction; a rule
+--                            publish is ONE logical batch even when it carries
+--                            thousands of historical recompute events;
+--   * delivery_events      - the immutable, gap-free event stream (seq 1..N),
+--                            one event per source position per state change;
+--   * delivery_consumers   - named consumers with their pinned initial-snapshot
+--                            boundary, confirmed cursor and optional
+--                            unacknowledged outstanding page (at-least-once);
+--   * delivery_ack_rejects - durable audit trail of every invalid ack attempt.
+--
+-- Candidate recompute rows and unapproved correction proposals are never
+-- written here: they are invisible until a publish/approval transaction makes
+-- them official, at which point they appear as one complete batch.
+-- ===========================================================================
+
+CREATE TABLE IF NOT EXISTS delivery_batches(
+  batch_id     INTEGER PRIMARY KEY,
+  kind         TEXT NOT NULL CHECK(kind IN
+                 ('bootstrap','ingest','correction','publish')),
+  producer_ref TEXT NOT NULL,          -- worker/correction id, review token...
+  rule_version TEXT NOT NULL,          -- active version for the batch
+  publish_seq  INTEGER NOT NULL,       -- publish sequence at batch time
+  created_at   INTEGER NOT NULL,
+  event_count  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS delivery_events(
+  seq            INTEGER PRIMARY KEY,  -- gap-free global order, 1-based
+  batch_id       INTEGER NOT NULL,
+  partition_id   INTEGER NOT NULL,
+  offset         INTEGER NOT NULL,
+  source_revision INTEGER NOT NULL,    -- effective source revision at emit time
+  rule_version   TEXT NOT NULL,        -- official cleaning version at emit time
+  status         TEXT NOT NULL CHECK(status IN ('ok','rejected')),
+  result_json    TEXT,                 -- iff status='ok'
+  error_json     TEXT,                 -- iff status='rejected'
+  created_at     INTEGER NOT NULL,
+  FOREIGN KEY(batch_id) REFERENCES delivery_batches(batch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_events_po
+  ON delivery_events(partition_id, offset);
+CREATE INDEX IF NOT EXISTS idx_delivery_events_batch
+  ON delivery_events(batch_id);
+
+CREATE TABLE IF NOT EXISTS delivery_consumers(
+  consumer_id      TEXT PRIMARY KEY,
+  state            TEXT NOT NULL CHECK(state IN
+                     ('registered','syncing','active')),
+  created_at       INTEGER NOT NULL,
+  -- highest event seq included in the consistent initial snapshot; NULL until
+  -- the initial sync is started; 0 means "empty snapshot, live feed only"
+  boundary_seq     INTEGER,
+  -- last fully acknowledged event seq; 0 = nothing acknowledged yet
+  acked_seq        INTEGER NOT NULL DEFAULT 0,
+  -- at most ONE unacknowledged page per consumer: these columns pin its exact
+  -- content so a re-read before ack returns the same records and cursors, and
+  -- a retry whose content changed is rejected rather than silently replacing it
+  page_from_seq    INTEGER,
+  page_to_seq      INTEGER,
+  page_cursor      TEXT,               -- opaque token handed to the consumer
+  page_digest      TEXT,               -- sha256 of the exact page contents
+  page_delivered_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS delivery_ack_rejects(
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  at_ms        INTEGER NOT NULL,
+  consumer_id  TEXT NOT NULL,
+  cursor       TEXT,
+  reason       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_consumers_state
+  ON delivery_consumers(state);
 """

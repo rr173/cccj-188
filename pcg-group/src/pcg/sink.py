@@ -158,7 +158,16 @@ def commit_batch(conn: sqlite3.Connection, clock, *, partition: int, gen: int,
                  json.dumps(it.clean_value, sort_keys=True, separators=(",", ":"),
                             ensure_ascii=False), now),
             )
+        # normalise the delivery payload to canonical JSON strings (build_outcome
+        # returns a JSON string for 'ok' and a dict for 'rejected').
+        delivery_outcomes = []
         for offset, status, payload in rule_outcomes:
+            if status == "ok":
+                payload_json = payload
+            else:
+                payload_json = json.dumps(payload, sort_keys=True,
+                                          separators=(",", ":"), ensure_ascii=False)
+            delivery_outcomes.append((offset, status, payload_json))
             if status == "ok":
                 conn.execute(
                     "INSERT INTO rule_results(version_id,partition_id,offset,"
@@ -171,9 +180,7 @@ def commit_batch(conn: sqlite3.Connection, clock, *, partition: int, gen: int,
                     "INSERT INTO rule_results(version_id,partition_id,offset,"
                     "status,result_json,error_json,computed_at,source_revision) "
                     "VALUES(?,?,?,'rejected',NULL,?,?,0)",
-                    (active_version_id, partition, offset,
-                     json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                                ensure_ascii=False), now),
+                    (active_version_id, partition, offset, payload_json, now),
                 )
         # the backfill watermark of the active version advances with progress,
         # so a later recompute resumes exactly after these committed rows
@@ -189,6 +196,15 @@ def commit_batch(conn: sqlite3.Connection, clock, *, partition: int, gen: int,
             "worker_id=excluded.worker_id, updated_at=excluded.updated_at",
             (partition, end, gen, worker_id, now),
         )
+        # delivery events for the new official positions land in this SAME
+        # transaction: the business rows and their change-log entries can never
+        # commit independently, so no committed change is ever undeliverable.
+        from .delivery_store import emit_ingest_events
+        emit_ingest_events(
+            conn, partition=partition, items=items,
+            rule_outcomes=delivery_outcomes, active_version=active_version_id,
+            publish_seq=rule_state["publish_seq"], worker_id=worker_id,
+            now_ms=now)
         conn.execute("COMMIT")
         return end
     except CommitRejected:

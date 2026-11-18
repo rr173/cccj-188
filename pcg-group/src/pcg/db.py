@@ -45,6 +45,7 @@ def init_db(db_path: str) -> None:
     import time
 
     from .correct_store import correct_migrate
+    from .delivery_store import delivery_migrate
     from .rule_store import rule_migrate
 
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
@@ -58,6 +59,9 @@ def init_db(db_path: str) -> None:
         # correction-workflow upgrade (columns + sequence; never rewrites
         # existing raw or cleaned values; safe to repeat)
         correct_migrate(conn, int(time.time() * 1000))
+        # durable change-delivery upgrade (append-only event log + bootstrap
+        # snapshot of the current official state; safe and idempotent)
+        delivery_migrate(conn, int(time.time() * 1000), db_path=db_path)
         conn.commit()
     finally:
         conn.close()

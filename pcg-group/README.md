@@ -87,19 +87,24 @@ terms.
 src/pcg/            coordinator, worker, admin, inspect, sink, planner, clock, source, clean
 src/pcg/rule_*.py   versioned cleaning-rule engine, store, recompute, review, export, CLI
 src/pcg/correct_*.py source-record correction store + CLI (propose/approve/history)
+src/pcg/delivery_*.py durable change-delivery log, named consumers + CLI
 docs/rules.md       full rule-publishing contract, CLI and upgrade guide
 docs/corrections.md full correction-workflow contract, CLI and upgrade guide
+docs/delivery.md    full change-delivery contract, CLI and upgrade guide
 tools/gensource.py  generate an immutable JSONL source (never committed)
 tools/reconcile.py  independent reference audit (re-reads source, recomputes values)
 tools/demo.sh       one-command reproducible terminal demo
 tools/demo_rules.sh one-command demo of the rule publishing workflow
 tools/demo_correct.sh one-command demo of the correction workflow
+tools/demo_delivery.sh one-command demo of durable change delivery
 tools/soak.py       small-memory long-run with membership churn + reconciliation
-tools/run_tests.sh  full automated test suite (collection/handoff/rules/corrections)
+tools/run_tests.sh  full automated test suite (collection/handoff/rules/corrections/delivery)
 tools/run_rule_tests.sh  acceptance suite for rule publishing (real processes)
 tools/run_correct_tests.sh acceptance suite for corrections (real processes)
+tools/run_delivery_tests.sh acceptance suite for change delivery (real processes)
 tests/              real multi-process end-to-end tests
 tests/tools_rule_ref.py independent reference rule evaluator (no production cleaner imports)
+tests/tools_delivery_ref.py independent delivery verifier (no production imports)
 ```
 
 ## Quick start
@@ -113,9 +118,10 @@ Standard library only (Python 3.11, SQLite >= 3.40). No third-party packages.
 # 2) automated tests (real processes; ~2.5 min)
 ./tools/run_tests.sh
 
-# 3) rule-publishing and correction demos
+# 3) rule-publishing, correction and delivery demos
 ./tools/demo_rules.sh
 ./tools/demo_correct.sh
+./tools/demo_delivery.sh
 
 # 4) small-memory long run (wall clock; graceful + SIGKILL churn)
 python3 tools/soak.py --out /tmp/pcg-soak --runtime 120 --workers 3 \
@@ -135,6 +141,7 @@ python3 -m pcg --db g.db --clock manual admin add|remove|list|barrier-release|ba
 python3 -m pcg --db g.db --clock manual inspect [--json]
 python3 -m pcg --db g.db rule    register|recompute|status|review|diff|activate|export
 python3 -m pcg --db g.db correct show|propose|restore|list|get|approve|reject|history
+python3 -m pcg --db g.db delivery create|start|read|ack|replay|position|list|batches|rejects
 ```
 The shared `--db/--clock` options are accepted either before or after the
 subcommand.
@@ -188,8 +195,51 @@ Run it end to end with `./tools/demo_rules.sh` and the acceptance suite with
 on skewed partitions and an independent reference evaluator that imports none
 of the production cleaning code).
 
-## Source-record corrections (review-gated, append-only)
+## Durable change delivery (persistent cursor consumers)
 
+Independent downstream programs can follow official results through a
+durable, append-only change log stored in the same database instead of
+repeatedly exporting full data or joining internal tables. Each consumer
+starts from one consistent snapshot and then receives only new/changed
+official records; the contract is at-least-once with stable event ids for
+idempotent application. Full contract and migration guide:
+[`docs/delivery.md`](docs/delivery.md).
+
+```bash
+python -m pcg --db g.db delivery create analytics           # named consumer
+python -m pcg --db g.db delivery start analytics            # pin snapshot boundary
+python -m pcg --db g.db delivery read analytics --page-size 100 --json
+python -m pcg --db g.db delivery ack analytics <cursor>     # after applying a page
+python -m pcg --db g.db delivery replay analytics --json    # same page pre-ack
+python -m pcg --db g.db delivery position analytics         # boundary/cursor/lag
+python -m pcg --db g.db delivery list|batches|rejects
+```
+
+Safety properties, all covered by real-process acceptance tests
+(`./tools/run_delivery_tests.sh`, demo via `./tools/demo_delivery.sh`):
+
+* every ingest commit, correction approval and rule activation writes its
+  delivery events in the **same transaction** as the business change — no
+  committed change is ever missing from the stream and vice versa;
+* events carry the stable position `(partition, offset)` plus the source
+  revision, cleaning version and result/rejection diagnostic in force; a
+  later state of the same position is a new event, never a new position;
+* pending correction proposals and candidate rule recomputes are invisible —
+  only approvals and activations emit, and one activation is ONE logical
+  `publish` batch. Large batches arrive as bounded page-sized chunks that
+  never mix batches; only the final chunk is marked `batch_complete`, so a
+  partial publish can never be confirmed;
+* the initial sync pins one consistent section and its change boundary:
+  writes that continue afterwards arrive as live events with no gap, and
+  paging/reads stream with bounded memory (verified on skewed long histories);
+* one pinned outstanding page per consumer makes re-reads byte-identical;
+  stale, skip-ahead, cross-consumer and tampered acks are refused with exit
+  codes and a durable audit row — unacknowledged changes cannot be lost;
+* consumers are fully independent, and an independent reference program
+  (`tests/tools_delivery_ref.py`, imports no product code) audits snapshots,
+  ordering, revisions, payloads, cursors and ack boundaries directly.
+
+## Source-record corrections (review-gated, append-only)
 When upstream confirms that an already-committed record itself was wrong
 (e.g. a mistyped city), operators can correct it **without** rewriting the
 read-only JSONL, `records.source_json`/`clean_json`, collection progress, or
@@ -260,6 +310,12 @@ and checks **every** `(partition, offset)`: presence exactly once, raw source,
 recomputed clean value, and exact contiguous progress — not just row counts.
 `--allow-incomplete` audits the committed prefix while a run is still in
 progress.
+
+The independent delivery verifier (`tests/tools_delivery_ref.py`) reads the
+database directly, imports no product code, and re-derives every delivery
+invariant: gap-free events, tiling batches, per-position revision order,
+payload equality with official rows, publish-batch completeness, consumer
+cursor continuity, two independent snapshot rebuilds and the ack-reject audit.
 
 ## Signals and failure semantics
 * **SIGTERM** — stop pulling, settle the current batch (commit or take the

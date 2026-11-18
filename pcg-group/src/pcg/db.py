@@ -44,6 +44,7 @@ def init_db(db_path: str) -> None:
     """
     import time
 
+    from .correct_store import correct_migrate
     from .rule_store import rule_migrate
 
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
@@ -54,6 +55,10 @@ def init_db(db_path: str) -> None:
         # in short transactions so a populated database never blocks writers
         # for the whole history.
         rule_migrate(conn, int(time.time() * 1000))
+        # correction-workflow upgrade (columns + sequence; never rewrites
+        # existing raw or cleaned values; safe to repeat)
+        correct_migrate(conn, int(time.time() * 1000))
+        conn.commit()
     finally:
         conn.close()
 

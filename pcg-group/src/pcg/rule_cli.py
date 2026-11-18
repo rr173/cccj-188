@@ -103,9 +103,11 @@ def cmd_recompute(db_path: str, clock_mode: str, args) -> int:
 
         def cb(page):
             state = "PAUSED(not flushed)" if not page.flushed else "flushed"
+            extra = f" revalidated={page.revalidated}" if page.revalidated else ""
             print(f"  p{page.partition_id} offsets {page.start_offset}.."
                   f"{page.end_offset}: {page.rows} rows "
-                  f"(ok={page.ok} rejected={page.rejected}) {state}", flush=True)
+                  f"(ok={page.ok} rejected={page.rejected}) "
+                  f"[{page.kind}] {state}{extra}", flush=True)
 
         print(f"recompute {args.version_id}: page_size={args.page_size}"
               + (f" pause_file={args.pause_file}" if args.pause_file else ""))
@@ -120,6 +122,7 @@ def cmd_recompute(db_path: str, clock_mode: str, args) -> int:
         print(f"  pages_flushed={report.pages_flushed} "
               f"rows_computed={report.rows_computed} "
               f"ok={report.ok} rejected={report.rejected} "
+              f"refreshed={report.refreshed} "
               f"complete={'yes' if report.complete else 'no'}")
         for c in report.coverage:
             print(f"  p{c['partition_id']}: covered {c['covered']}/{c['total']} "
@@ -142,6 +145,15 @@ def cmd_status(db_path: str, clock_mode: str, args) -> int:
     state = get_active(conn)
     print(f"clock now_ms={now} ({clock.mode})")
     print(f"active_version={state['active_version']} publish_seq={state['publish_seq']}")
+    from .correct_store import correction_seq
+    corr_seq = correction_seq(conn)
+    n_corr = conn.execute(
+        "SELECT COUNT(*) c FROM source_corrections").fetchone()["c"]
+    n_pend = conn.execute(
+        "SELECT COUNT(*) c FROM correction_proposals WHERE state='pending'"
+    ).fetchone()["c"]
+    print(f"correction_seq={corr_seq} revisions={n_corr} "
+          f"pending_proposals={n_pend}")
     print("\n== versions ==")
     for v in list_versions(conn):
         tag = " [ACTIVE]" if v["is_active"] else ""
@@ -200,7 +212,8 @@ def cmd_review(db_path: str, clock_mode: str, args) -> int:
     print(f"review token: {out['token']}")
     print(f"  candidate={out['candidate']} base={out['base']}")
     print(f"  spec_sha256={out['spec_sha256']}")
-    print(f"  section publish_seq={out['publish_seq']}")
+    print(f"  section publish_seq={out['publish_seq']} "
+          f"correction_seq={out['correction_seq']}")
     print("  offset vector (partition: last committed offset, -1 = empty):")
     for pid, off in out["vector"].items():
         print(f"    p{pid}: {off}")
@@ -208,7 +221,7 @@ def cmd_review(db_path: str, clock_mode: str, args) -> int:
     print("  stats:")
     print(f"    positions={s['positions']} same={s['same']} changed={s['changed']}")
     print(f"    candidate_rejected={s['candidate_rejected']} "
-          f"uncovered={s['uncovered']} "
+          f"uncovered={s['uncovered']} stale={s['stale']} "
           f"base_rejected_candidate_ok={s['base_rejected_candidate_ok']}")
     return 0
 
@@ -301,6 +314,7 @@ def cmd_export(db_path: str, clock_mode: str, args) -> int:
             return 0
         print(f"# export section: version={section['version_id']} "
               f"publish_seq={section['publish_seq']} "
+              f"correction_seq={section['correction_seq']} "
               f"positions={section['positions']}")
         print("# offset vector: " +
               " ".join(f"p{k}={v}" for k, v in

@@ -4,15 +4,20 @@ A review fixes an explicit data section:
 
 * the vector of per-partition committed offsets (empty partition => -1);
 * the currently active version and the monotonic publish sequence;
-* the candidate rule's content hash.
+* the candidate rule's content hash;
+* the global correction sequence, which pins the exact set of effected
+  source-record corrections (revisions are immutable and append-only, so one
+  monotonic number identifies the whole source-revision state).
 
 All per-position findings are computed inside one read-only WAL snapshot and
 materialised through a separate writer in bounded, short transactions, so
-ingestion and recomputation that happen afterwards cannot silently alter what
-the review represented (and the scan never blocks writers). Activation
-re-validates the persisted token against the *current* pointer, sequence,
-offset vector and candidate coverage inside another single atomic
-transaction.
+ingestion, recomputation and corrections that happen afterwards cannot
+silently alter what the review represented (and the scan never blocks
+writers). Activation re-validates the persisted token against the *current*
+pointer, sequence, offset vector, correction sequence and candidate coverage
+inside another single atomic transaction: a correction that lands after the
+review - even one later undone back to the original value - moves the
+correction sequence and therefore kills the token.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import json
 import secrets
 import sqlite3
 
+from .correct_store import correction_seq, revision_map
 from .rule_engine import json_type_name
 from .rule_store import get_active, load_version
 from .rule_recompute import _partitions
@@ -86,12 +92,21 @@ REVIEW_PAGE = 500
 
 
 def _classify_position(conn, candidate_id: str, base_id: str,
-                       pid: int, offset: int):
+                       pid: int, offset: int,
+                       revisions: dict[tuple[int, int], int]):
     """Return ``(kind, detail_dict_or_None)`` for one section position."""
     crow = _result_row(conn, candidate_id, pid, offset)
     brow = _result_row(conn, base_id, pid, offset)
+    cur_rev = revisions.get((pid, offset), 0)
     if crow is None:
         return "uncovered", {"reason": "candidate has no result at this position"}
+    if crow["source_revision"] < cur_rev:
+        return "stale", {
+            "reason": "candidate result predates the current source "
+                      "correction; run recompute",
+            "result_revision": crow["source_revision"],
+            "current_revision": cur_rev,
+        }
     if crow["status"] == "rejected":
         detail = {"candidate_error": json.loads(crow["error_json"])}
         if brow is not None:
@@ -138,18 +153,21 @@ def create_review(conn: sqlite3.Connection, candidate_id: str,
 
     token = secrets.token_hex(16)
     stats = {"same": 0, "changed": 0, "candidate_rejected": 0,
-             "uncovered": 0, "base_rejected_candidate_ok": 0, "positions": 0}
+             "uncovered": 0, "base_rejected_candidate_ok": 0, "stale": 0,
+             "positions": 0}
 
     # ---- read-only snapshot section: no write lock is held for the scan ----
     conn.execute("BEGIN")
     try:
         vector = snapshot_vector(conn)
+        revisions = revision_map(conn)
+        corr_seq = correction_seq(conn)
         header_written = False
         pending: list[tuple] = []
 
-        def flush(force_header: bool = False) -> None:
+        def flush(force_header: bool = False, final_stats: str | None = None) -> None:
             nonlocal header_written
-            if not force_header and not pending:
+            if not force_header and not pending and final_stats is None:
                 return
             if own_writer:
                 writer_conn.execute("BEGIN IMMEDIATE")
@@ -163,19 +181,26 @@ def create_review(conn: sqlite3.Connection, candidate_id: str,
                     writer_conn.execute(
                         "INSERT INTO rule_reviews(token,version_id,base_version,"
                         "spec_sha256,offset_vector_json,publish_seq,stats_json,"
-                        "created_at) VALUES(?,?,?,?,?,?,?,?)",
+                        "created_at,correction_seq) VALUES(?,?,?,?,?,?,?,?,?)",
                         (token, candidate_id, base_id, candidate["spec_sha256"],
                          json.dumps(vector, sort_keys=True,
                                     separators=(",", ":")),
                          state["publish_seq"],
                          json.dumps(stats, sort_keys=True,
-                                    separators=(",", ":")), now_ms))
+                                    separators=(",", ":")), now_ms, corr_seq))
                     header_written = True
                 for p_pid, p_offset, kind, detail in pending:
                     writer_conn.execute(
                         "INSERT INTO rule_review_items(token,partition_id,offset,"
                         "kind,detail_json) VALUES(?,?,?,?,?)",
                         (token, p_pid, p_offset, kind, detail))
+                if final_stats is not None:
+                    # the header may have been written by an early page flush
+                    # with only partial counters: persist the FINAL stats so
+                    # the saved token always describes the complete section
+                    writer_conn.execute(
+                        "UPDATE rule_reviews SET stats_json=? WHERE token=?",
+                        (final_stats, token))
                 writer_conn.execute("COMMIT")
             except Exception:
                 writer_conn.execute("ROLLBACK")
@@ -190,7 +215,7 @@ def create_review(conn: sqlite3.Connection, candidate_id: str,
             for offset in range(last_off + 1):
                 stats["positions"] += 1
                 kind, detail = _classify_position(
-                    conn, candidate_id, base_id, pid, offset)
+                    conn, candidate_id, base_id, pid, offset, revisions)
                 stats[kind] += 1
                 if kind == "same":
                     continue  # counted, but not materialised as a finding
@@ -199,8 +224,11 @@ def create_review(conn: sqlite3.Connection, candidate_id: str,
                     ensure_ascii=False)))
                 if own_writer and len(pending) >= REVIEW_PAGE:
                     flush()
-        # always write the header even when there are zero findings
-        flush(force_header=not header_written)
+        # always write the header even when there are zero findings, and
+        # persist the final stats with the last page
+        flush(force_header=not header_written,
+              final_stats=json.dumps(stats, sort_keys=True,
+                                     separators=(",", ":")))
         conn.execute("ROLLBACK")  # read-only snapshot release
     except Exception:
         conn.execute("ROLLBACK")
@@ -222,6 +250,7 @@ def create_review(conn: sqlite3.Connection, candidate_id: str,
 
     return {"token": token, "candidate": candidate_id, "base": base_id,
             "vector": vector, "publish_seq": state["publish_seq"],
+            "correction_seq": corr_seq,
             "spec_sha256": candidate["spec_sha256"], "stats": stats}
 
 
@@ -245,8 +274,13 @@ def iter_review_items(conn: sqlite3.Connection, token: str):
 # ---------------------------------------------------------------------- activation
 
 def _candidate_covers_section(conn: sqlite3.Connection, candidate_id: str,
-                              vector: dict[int, int]) -> tuple[bool, str | None]:
-    """Every section position must have an 'ok' candidate result."""
+                           vector: dict[int, int]) -> tuple[bool, str | None]:
+    """Every section position must have a CURRENT 'ok' candidate result.
+
+    A result whose ``source_revision`` predates the position's current
+    correction revision is stale and counts as not covered: the candidate
+    must be recomputed over the corrected objects before it can publish.
+    """
     for pid, last_off in vector.items():
         if last_off < 0:
             continue
@@ -267,6 +301,20 @@ def _candidate_covers_section(conn: sqlite3.Connection, candidate_id: str,
         if n != last_off + 1:
             return False, (f"candidate {candidate_id} has only {n}/{last_off + 1} "
                            f"successful results on partition {pid} (holes present)")
+        stale = conn.execute(
+            "SELECT cs.offset, cs.revision, rr.source_revision FROM "
+            "correction_state cs JOIN rule_results rr ON rr.version_id=? "
+            "AND rr.partition_id=cs.partition_id AND rr.offset=cs.offset "
+            "WHERE cs.partition_id=? AND cs.offset<=? "
+            "AND rr.source_revision < cs.revision LIMIT 1",
+            (candidate_id, pid, last_off),
+        ).fetchone()
+        if stale is not None:
+            return False, (
+                f"candidate {candidate_id} result at p{pid} offset "
+                f"{stale['offset']} is stale (source revision "
+                f"{stale['source_revision']} < current {stale['revision']}); "
+                "run recompute to catch up with source corrections")
     return True, None
 
 
@@ -299,6 +347,13 @@ def activate(conn: sqlite3.Connection, token: str, now_ms: int,
             failures.append(
                 f"committed offset vector changed after the review: "
                 f"review={vector} current={current_vector}; re-run review")
+        current_corr_seq = correction_seq(conn)
+        if review["correction_seq"] != current_corr_seq:
+            failures.append(
+                f"source corrections changed after the review: review "
+                f"correction_seq={review['correction_seq']} current "
+                f"{current_corr_seq}; a correction took effect (possibly "
+                "since undone) - re-run review")
 
         # already-active candidate: report that no switch is needed. This never
         # "restores" the token -- nothing is written, the pointer/sequence do

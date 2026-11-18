@@ -138,6 +138,9 @@ def commit_batch(conn: sqlite3.Connection, clock, *, partition: int, gen: int,
         # at commit time. Source rows + progress + versioned outcomes therefore
         # land atomically; a rule rejection keeps the raw row and progress and
         # stores an explicit diagnostic instead of silently dropping the row.
+        # Newly committed offsets are always at source revision 0: corrections
+        # can only target already-committed positions, so no correction can
+        # exist for this batch's offsets.
         rule_state = get_active(conn)
         active_version_id = rule_state["active_version"]
         active_version = load_version(conn, active_version_id)
@@ -159,15 +162,15 @@ def commit_batch(conn: sqlite3.Connection, clock, *, partition: int, gen: int,
             if status == "ok":
                 conn.execute(
                     "INSERT INTO rule_results(version_id,partition_id,offset,"
-                    "status,result_json,error_json,computed_at) "
-                    "VALUES(?,?,?,'ok',?,NULL,?)",
+                    "status,result_json,error_json,computed_at,source_revision) "
+                    "VALUES(?,?,?,'ok',?,NULL,?,0)",
                     (active_version_id, partition, offset, payload, now),
                 )
             else:
                 conn.execute(
                     "INSERT INTO rule_results(version_id,partition_id,offset,"
-                    "status,result_json,error_json,computed_at) "
-                    "VALUES(?,?,?,'rejected',NULL,?,?)",
+                    "status,result_json,error_json,computed_at,source_revision) "
+                    "VALUES(?,?,?,'rejected',NULL,?,?,0)",
                     (active_version_id, partition, offset,
                      json.dumps(payload, sort_keys=True, separators=(",", ":"),
                                 ensure_ascii=False), now),

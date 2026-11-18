@@ -238,4 +238,65 @@ CREATE INDEX IF NOT EXISTS idx_rule_results_po
   ON rule_results(partition_id, offset);
 CREATE INDEX IF NOT EXISTS idx_rule_rcp_version
   ON rule_recompute_progress(version_id);
+
+-- ===========================================================================
+-- Source-record corrections (see docs/corrections.md and pcg.correct_*).
+--
+-- Corrections never rewrite records.source_json / records.clean_json, the
+-- original JSONL, collection progress, or other versions' recompute results.
+-- Every effected correction APPENDS one immutable row to source_corrections
+-- and moves the per-position pointer in correction_state; the global
+-- correction sequence in meta('correction_seq') is bumped exactly once per
+-- effected correction so review tokens can pin the whole revision set.
+-- ===========================================================================
+
+-- operator-submitted replacement proposals (pre-review; invisible to every
+-- official read until approved)
+CREATE TABLE IF NOT EXISTS correction_proposals(
+  correction_id  TEXT PRIMARY KEY,   -- caller-provided idempotency key
+  partition_id   INTEGER NOT NULL,
+  offset         INTEGER NOT NULL,
+  expected_revision INTEGER NOT NULL,  -- revision the operator based this on
+  prev_json      TEXT NOT NULL,        -- effective object seen at propose time
+  new_json       TEXT NOT NULL,        -- complete replacement object (canonical)
+  reason         TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,        -- hash of the full proposal content
+  state          TEXT NOT NULL CHECK(state IN ('pending','applied','rejected')),
+  created_at     INTEGER NOT NULL,
+  decided_at     INTEGER,
+  decided_note   TEXT
+);
+
+-- immutable, append-only revision log: one row per effected correction.
+-- revision is strictly increasing per (partition_id, offset) starting at 1;
+-- revision 0 is defined as the originally collected records.source_json.
+CREATE TABLE IF NOT EXISTS source_corrections(
+  partition_id   INTEGER NOT NULL,
+  offset         INTEGER NOT NULL,
+  revision       INTEGER NOT NULL,
+  correction_id  TEXT NOT NULL,
+  prev_json      TEXT NOT NULL,        -- complete effective object before
+  new_json       TEXT NOT NULL,        -- complete effective object after
+  reason         TEXT NOT NULL,
+  rule_version   TEXT NOT NULL,        -- active version the effect was
+                                       -- processed under
+  publish_seq    INTEGER NOT NULL,     -- publish sequence at effect time
+  created_at     INTEGER NOT NULL,
+  PRIMARY KEY(partition_id, offset, revision)
+) WITHOUT ROWID;
+
+-- per-position pointer to the current revision (only positions with at least
+-- one effected correction appear; absence means revision 0 = original)
+CREATE TABLE IF NOT EXISTS correction_state(
+  partition_id   INTEGER NOT NULL,
+  offset         INTEGER NOT NULL,
+  revision       INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  PRIMARY KEY(partition_id, offset)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_corrections_po
+  ON source_corrections(partition_id, offset);
+CREATE INDEX IF NOT EXISTS idx_proposals_state
+  ON correction_proposals(state);
 """

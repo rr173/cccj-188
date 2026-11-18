@@ -12,11 +12,12 @@ database; collection commands, raw records, the historical `clean_json`,
 |---|---|
 | rule version | A JSON document registered under a caller-chosen `version_id`. Content-addressed by canonical JSON + SHA-256. |
 | `legacy` | The fixed built-in cleaner (`pcg.clean.clean_record`), reserved and impossible to overwrite or delete. |
-| `rule_results` | One row per `(version, partition_id, offset)`: either a full result (`status='ok'`) or an explicit rejection (`status='rejected'`). A missing row means *not covered yet*. |
+| `rule_results` | One row per `(version, partition_id, offset)`: either a full result (`status='ok'`) or an explicit rejection (`status='rejected'`). A missing row means *not covered yet*. `source_revision` records which source revision the outcome was computed from (0 = the collected record). |
 | backfill watermark | `rule_recompute_progress.done_offset` per version/partition; resumable recompute starts at `done_offset+1`. |
 | active version | Singleton pointer in `rule_state` with a strictly increasing `publish_seq`. |
-| review token | A persisted, immutable section snapshot (offset vector, active version, publish seq, candidate hash + materialised findings). |
-| export section | One read transaction fixing the active version, publish sequence and committed-offset vector for the whole export. |
+| review token | A persisted, immutable section snapshot (offset vector, active version, publish seq, candidate hash, correction sequence + materialised findings). |
+| export section | One read transaction fixing the active version, publish sequence, committed-offset vector and correction sequence for the whole export. |
+| source correction | An appended immutable revision replacing a committed record's effective object; see [corrections.md](corrections.md). |
 
 ## The rule contract
 
@@ -88,38 +89,67 @@ Exit codes: `0` ok · `2` arguments/IO · `3` invalid rule document ·
   with `op=null` for missing/null policy rejections.
 * Review findings kinds: `changed` (with per-field `base`/`candidate`
   presence, JSON type and value), `candidate_rejected`,
-  `base_rejected_candidate_ok`, `uncovered`.
+  `base_rejected_candidate_ok`, `uncovered`, `stale` (candidate result
+  predates the position's current source correction; recompute first).
 * Export rows (JSON mode): one header line `{"section": {...}}` then one JSON
   object per position containing `version_id`, `publish_seq`,
-  `partition_id`, `offset`, `status` and either `result` or `error`.
+  `correction_seq`, `partition_id`, `offset`, `source_revision`, `status`
+  and either `result` or `error`; rows of non-active versions whose
+  `source_revision` lags the position's correction head carry
+  `"stale": true`.
 
 ## The publishing workflow
 
 1. **Register** the candidate rule from a JSON file. The same id with the
    same content is a safe retry; any content change under an existing id is
    rejected (pick a new id instead).
-2. **Recompute** in pages. It reads only committed `records.source_json`, so
-   the original JSONL directory need not be accessible. Pages and watermarks
-   commit together; a killed process resumes at the next offset without
-   rescanning finished history. Collection progress and the active version
-   are never touched.
+2. **Recompute** in pages. It reads only committed positions (the immutable
+   `records.source_json` plus the current correction head per position), so
+   the original JSONL directory need not be accessible. Every position is
+   evaluated against its **current effective object**; positions whose
+   stored result predates a source correction are reprocessed by a paged
+   stale sweep. Pages and watermarks commit together; a killed process
+   resumes at the next offset without rescanning finished history.
+   Collection progress and the active version are never touched.
 3. **Review** the candidate against the currently active version on one
    explicit section. The token binds the rule hash, the offset vector
-   (empty partition = -1), the active version and the publish sequence; all
-   findings are materialised, so later writes cannot alter this review.
+   (empty partition = -1), the active version, the publish sequence and the
+   **correction sequence** (the exact set of effected source corrections);
+   all findings are materialised, so later writes cannot alter this review.
 4. **Activate**. A single `BEGIN IMMEDIATE` transaction re-checks that the
    token still matches the active version, publish sequence, latest offset
-   vector and rule hash, and that every section position has an `ok`
-   candidate result (no rejections, no holes). Only then does the pointer
-   move, with `publish_seq` incremented. Any failed check leaves the current
-   selection untouched.
+   vector, correction sequence and rule hash, and that every section
+   position has a *current* `ok` candidate result (no rejections, no holes,
+   no result older than its position's correction head). Only then does the
+   pointer move, with `publish_seq` incremented. Any failed check leaves the
+   current selection untouched.
 5. **Export** through the official read entry point, which pins one version
    and one section for the whole stream and prints rejections explicitly
    rather than skipping rows or substituting defaults.
 
 Rollback uses the identical contract: recompute the old version so it
-catches rows received while it was inactive, review, activate. There is no
-direct pointer flip to a version that lacks recent results.
+catches rows received (and corrections effected) while it was inactive,
+review, activate. There is no direct pointer flip to a version that lacks
+recent or current results.
+
+## Interaction with source-record corrections
+
+Corrections ([corrections.md](corrections.md)) replace a committed record's
+*effective object* by appending immutable revisions. The rule workflow is
+revision-aware throughout:
+
+* an effected correction reprocesses the new object under the **active**
+  version inside the approval transaction, so the official read is always
+  current; other versions become stale at that position and catch up via
+  recompute;
+* a review token created before any correction dies as soon as one takes
+  effect — even if it is later undone back to the original value — because
+  the token binds the global correction sequence, not JSON values;
+* activation refuses candidates with stale results; rollback to an old
+  version after corrections requires the same recompute → review → activate
+  contract as for new rows;
+* exports pin the correction sequence together with the version and offset
+  vector, so one export never mixes revision states.
 
 ## Interaction with live collection
 
@@ -147,7 +177,11 @@ databases:
    `rule_results` for `legacy` in bounded pages (short transactions);
 3. per-partition watermarks are seeded from `progress` and a durable
    migration marker (`meta.rule_migration_legacy_v1`) records completion, so
-   later worker processes never silently backfill an inactive version.
+   later worker processes never silently backfill an inactive version;
+4. the correction workflow adds its tables and the
+   `rule_results.source_revision` / `rule_reviews.correction_seq` columns
+   with constant defaults — existing rows are never rewritten — and starts
+   `meta.correction_seq` at 0.
 
 After upgrading, a `legacy` export is byte-identical to the pre-upgrade
 `clean_json` values.

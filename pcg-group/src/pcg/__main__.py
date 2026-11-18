@@ -5,6 +5,8 @@ Commands:
   worker        run a worker process
   admin         membership / barrier / clock control
   inspect       dump the full group state (read-only)
+  rule          versioned cleaning-rule publishing workflow
+  correct       source-record correction workflow (propose/approve/history)
 """
 
 from __future__ import annotations
@@ -72,6 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     from .rule_cli import add_rule_parser
     add_rule_parser(sub)
+    from .correct_cli import add_correct_parser
+    add_correct_parser(sub)
     return p
 
 
@@ -129,6 +133,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "rule":
         return args.rule_fn(args.db, args.clock, args)
+
+    if args.cmd == "correct":
+        return args.correct_fn(args.db, args.clock, args)
 
     return 2
 

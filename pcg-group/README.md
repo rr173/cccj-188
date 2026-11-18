@@ -86,14 +86,18 @@ terms.
 ```
 src/pcg/            coordinator, worker, admin, inspect, sink, planner, clock, source, clean
 src/pcg/rule_*.py   versioned cleaning-rule engine, store, recompute, review, export, CLI
+src/pcg/correct_*.py source-record correction store + CLI (propose/approve/history)
 docs/rules.md       full rule-publishing contract, CLI and upgrade guide
+docs/corrections.md full correction-workflow contract, CLI and upgrade guide
 tools/gensource.py  generate an immutable JSONL source (never committed)
 tools/reconcile.py  independent reference audit (re-reads source, recomputes values)
 tools/demo.sh       one-command reproducible terminal demo
 tools/demo_rules.sh one-command demo of the rule publishing workflow
+tools/demo_correct.sh one-command demo of the correction workflow
 tools/soak.py       small-memory long-run with membership churn + reconciliation
-tools/run_tests.sh  full automated test suite (collection/handoff)
+tools/run_tests.sh  full automated test suite (collection/handoff/rules/corrections)
 tools/run_rule_tests.sh  acceptance suite for rule publishing (real processes)
+tools/run_correct_tests.sh acceptance suite for corrections (real processes)
 tests/              real multi-process end-to-end tests
 tests/tools_rule_ref.py independent reference rule evaluator (no production cleaner imports)
 ```
@@ -106,10 +110,14 @@ Standard library only (Python 3.11, SQLite >= 3.40). No third-party packages.
 # 1) one-command demo (manual clock, deterministic)
 ./tools/demo.sh
 
-# 2) automated tests (real processes; ~25s)
+# 2) automated tests (real processes; ~2.5 min)
 ./tools/run_tests.sh
 
-# 3) small-memory long run (wall clock; graceful + SIGKILL churn)
+# 3) rule-publishing and correction demos
+./tools/demo_rules.sh
+./tools/demo_correct.sh
+
+# 4) small-memory long run (wall clock; graceful + SIGKILL churn)
 python3 tools/soak.py --out /tmp/pcg-soak --runtime 120 --workers 3 \
     --partitions 8 --per-partition 200 --skew
 ```
@@ -125,6 +133,8 @@ python3 -m pcg --db g.db --clock manual coordinator --source ./srcdir [opts]
 python3 -m pcg --db g.db --clock manual worker     --source ./srcdir --id w1
 python3 -m pcg --db g.db --clock manual admin add|remove|list|barrier-release|barrier-wait|tick
 python3 -m pcg --db g.db --clock manual inspect [--json]
+python3 -m pcg --db g.db rule    register|recompute|status|review|diff|activate|export
+python3 -m pcg --db g.db correct show|propose|restore|list|get|approve|reject|history
 ```
 The shared `--db/--clock` options are accepted either before or after the
 subcommand.
@@ -178,11 +188,64 @@ Run it end to end with `./tools/demo_rules.sh` and the acceptance suite with
 on skewed partitions and an independent reference evaluator that imports none
 of the production cleaning code).
 
+## Source-record corrections (review-gated, append-only)
+
+When upstream confirms that an already-committed record itself was wrong
+(e.g. a mistyped city), operators can correct it **without** rewriting the
+read-only JSONL, `records.source_json`/`clean_json`, collection progress, or
+other versions' recompute results. The full contract:
+[`docs/corrections.md`](docs/corrections.md).
+
+```bash
+python -m pcg --db g.db correct show 0 42                      # original vs effective
+python -m pcg --db g.db correct propose 0 42 --correction-id FIX-1 \
+    --expected-revision 0 --reason "city mistyped" \
+    --record '{"offset":42,"name":"...","city":"Berlin"}'      # complete replacement
+python -m pcg --db g.db correct list --state pending           # review queue
+python -m pcg --db g.db correct approve FIX-1                  # one atomic transaction
+python -m pcg --db g.db correct history 0 42                   # immutable revision chain
+python -m pcg --db g.db correct restore 0 42 --to-revision 0 \
+    --correction-id FIX-2 --expected-revision 1 --reason "undo" # undo = new revision
+```
+
+Safety properties, all covered by real-process acceptance tests
+(`./tools/run_correct_tests.sh`, demo via `./tools/demo_correct.sh`):
+
+* every effected correction appends an immutable revision (coordinates,
+  strictly increasing per-position revision number, correction id, complete
+  before/after objects, reason, time); undo appends a restoring revision,
+  never deletes;
+* correction ids are idempotent for identical content and rejected for
+  different content; proposals carry the operator's expected revision and
+  stale ones are refused with the actual revision — never a silent overwrite;
+* one proposal can be effected exactly once: concurrent approvals have
+  exactly one winner, losers get a conflict diagnostic;
+* proposals are invisible to exports, recomputes, reviews and diffs until
+  approved; a failed approval leaves no half-revision;
+* approval reprocesses the new object under the **current** active rule
+  version in the same transaction, landing a full result or an explicit
+  rejection diagnostic as the official row for that position;
+* rule recompute reads each position's current effective object; review
+  tokens die after any correction (even one later undone); inactive versions
+  must catch up and re-review before republishing; exports pin version,
+  revision set and results in one snapshot.
+
 ## What the tests prove (real processes, not mocks)
 
 * **Barrier handoff** — a worker computes offset 0..N but does not commit; the
   partition is transferred; on release the whole late batch is rejected, the
   successor completes it, and the new values are never overwritten.
+* **Barrier + correction** — with a batch parked between compute and commit,
+  a correction is approved at a position inside that batch's range (committed
+  by the successor); on release the stale batch is fence-rejected and the
+  correction's revision and official result are untouched.
+* **Correction review flow** — consecutive corrections and undo keep every
+  revision; ids are idempotent/conflicting as specified; stale proposals are
+  refused with the actual revision; racing approvals have exactly one winner;
+  pending proposals change no official read; review tokens die after any
+  correction, even undone ones; inactive versions catch up over effective
+  objects before republishing; exports stay single-snapshot consistent while
+  approvals and publishes interleave.
 * **Graceful revoke** — SIGTERM drains with a bound ack.
 * **Kill mid-revoke** — SIGKILL with no ack; the coordinator fences the term.
 * **Coordinator restart** — epoch bump and uniform sealing of an old term.

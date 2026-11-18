@@ -209,7 +209,11 @@ class TestCoordinatorRestart(PcgTestCase):
 class TestLateStaleAck(PcgTestCase):
     def test_old_plan_ack_is_quarantined_not_applied(self):
         # pre-register two members so the first plan is already stable:
-        # w1->p0, w2->p1. Then remove w2 and hard-kill it; w1 takes p1.
+        # w1->p0, w2->p1. Hard-kill w2 FIRST (before any membership change)
+        # so the dead incarnation can never write a graceful ack; removing it
+        # afterwards forces the coordinator to fence the dead term. (Doing it
+        # in the other order races with w2's own graceful-drain exit, which
+        # legitimately acks before the SIGKILL lands.)
         pg = self.new_group([6, 6], lease_ms=900, ack_timeout_ms=1000)
         pg.admin("add", "w1", "--lease-ms", "900")
         pg.admin("add", "w2", "--lease-ms", "900")
@@ -222,14 +226,14 @@ class TestLateStaleAck(PcgTestCase):
         old = pg.sql_one(
             "SELECT * FROM assignments WHERE partition_id=1 ORDER BY gen DESC LIMIT 1")
         self.assertEqual(old["worker_id"], "w2")
+        pg.sigkill("w2")
+        pg.wait_exit("w2")
         pg.admin("remove", "w2")
         # wait for the single transfer revocation to be published (it may
-        # already have progressed past 'waiting' under load), then hard-kill w2
+        # already have progressed past 'waiting' under load)
         pg.wait_for(lambda: pg.sql_one(
             "SELECT 1 FROM revocations WHERE partition_id=1 AND gen=?",
             (old["gen"],)))
-        pg.sigkill("w2")
-        pg.wait_exit("w2")
         # coordinator fences the old generation instead of waiting forever
         pg.wait_for(lambda: pg.sql_one(
             "SELECT state FROM assignments WHERE partition_id=1 AND gen=?",

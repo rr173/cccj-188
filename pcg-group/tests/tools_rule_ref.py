@@ -122,6 +122,91 @@ def ref_outcome(spec, source_obj):
                             ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# Independent re-implementation of the FIXED built-in cleaner (the 'legacy'
+# version). Used only to audit results computed from CORRECTED objects; the
+# revision-0 audit stays a pure byte comparison against records.clean_json.
+# Written from the documented contract in src/pcg/clean.py without importing
+# or calling any production cleaning function.
+# ---------------------------------------------------------------------------
+
+_REF_BOOL_TRUE = {"true", "1", "yes", "on"}
+_REF_BOOL_FALSE = {"false", "0", "no", "off"}
+_REF_KNOWN = {"name", "email", "city", "amount", "active"}
+
+
+def _ref_collapse(s):
+    return " ".join(s.split())
+
+
+def ref_clean_fixed(src):
+    def name(v):
+        if v is None:
+            return ""
+        return _ref_collapse(unicodedata.normalize("NFKC", str(v)).strip()).title()
+
+    def email(v):
+        if v is None:
+            return ""
+        return unicodedata.normalize("NFKC", str(v)).strip().lower()
+
+    def city(v):
+        if v is None:
+            return ""
+        s = str(v).replace("_", " ").replace("-", " ")
+        return _ref_collapse(unicodedata.normalize("NFKC", s).strip()).title()
+
+    def amount(v):
+        if isinstance(v, bool):
+            return 1.0 if v else 0.0
+        if isinstance(v, (int, float)):
+            return round(float(v), 2)
+        try:
+            return round(float(str(v).strip().replace(",", "")), 2)
+        except (ValueError, TypeError):
+            return 0.0
+
+    def active(v):
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return v != 0
+        s = str(v).strip().lower()
+        if s in _REF_BOOL_TRUE:
+            return True
+        if s in _REF_BOOL_FALSE:
+            return False
+        return False
+
+    out = {"name": name(src.get("name")), "email": email(src.get("email")),
+           "city": city(src.get("city")), "amount": amount(src.get("amount")),
+           "active": active(src.get("active"))}
+    for k in sorted(src):
+        if k not in _REF_KNOWN:
+            out[k] = src[k]
+    return out
+
+
+def _canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def _effective_objects(conn):
+    """(pid, offset) -> {revision: object}, revision 0 = collected record."""
+    out = {}
+    for r in conn.execute(
+            "SELECT partition_id, offset, source_json FROM records"):
+        out.setdefault((r["partition_id"], r["offset"]), {})[0] = \
+            json.loads(r["source_json"])
+    for r in conn.execute(
+            "SELECT partition_id, offset, revision, new_json FROM "
+            "source_corrections"):
+        out.setdefault((r["partition_id"], r["offset"]), {})[r["revision"]] = \
+            json.loads(r["new_json"])
+    return out
+
+
 def _reason_matches(prod_reason, key):
     table = {
         "not_string": ["must be a string"],
@@ -133,41 +218,75 @@ def _reason_matches(prod_reason, key):
     return any(marker in prod_reason for marker in table[key])
 
 
-def verify_version(conn, version_row, problems):
-    """Check every stored outcome of one version against the reference."""
+def verify_version(conn, version_row, problems, effective=None):
+    """Check every stored outcome of one version against the reference.
+
+    Each result row is audited against the effective object of the source
+    revision it claims (``source_revision``): revision 0 is the immutable
+    collected ``records.source_json``; revision N is the Nth correction's
+    complete replacement object.
+    """
     vid = version_row["version_id"]
+    if effective is None:
+        effective = _effective_objects(conn)
     if version_row["builtin"]:
-        # built-in outcomes must be byte-identical to the immutable sink value
         rows = conn.execute(
             "SELECT rr.partition_id, rr.offset, rr.status, rr.result_json, "
-            "rr.error_json, r.clean_json FROM rule_results rr "
-            "JOIN records r ON r.partition_id=rr.partition_id "
+            "rr.error_json, rr.source_revision, r.clean_json FROM "
+            "rule_results rr JOIN records r ON r.partition_id=rr.partition_id "
             "AND r.offset=rr.offset WHERE rr.version_id=?", (vid,))
         for row in rows:
-            if row["status"] != "ok" or row["result_json"] != row["clean_json"]:
+            pos = (row["partition_id"], row["offset"])
+            rev = row["source_revision"]
+            if row["status"] != "ok":
                 problems.append(
-                    f"legacy mismatch p{row['partition_id']} o{row['offset']}: "
-                    f"{row['status']} {row['result_json']!r} != clean_json")
+                    f"legacy p{pos[0]} o{pos[1]}: unexpected rejection")
+                continue
+            if rev == 0:
+                # byte-identity with the immutable sink value
+                if row["result_json"] != row["clean_json"]:
+                    problems.append(
+                        f"legacy mismatch p{pos[0]} o{pos[1]}: "
+                        f"{row['result_json']!r} != clean_json")
+            else:
+                # computed from the corrected object by the fixed cleaner;
+                # audit with the independent re-implementation
+                obj = effective.get(pos, {}).get(rev)
+                if obj is None:
+                    problems.append(
+                        f"legacy p{pos[0]} o{pos[1]}: unknown source "
+                        f"revision {rev}")
+                    continue
+                want = _canon(ref_clean_fixed(obj))
+                if row["result_json"] != want:
+                    problems.append(
+                        f"legacy p{pos[0]} o{pos[1]} rev {rev}: "
+                        f"{row['result_json']!r} != reference {want!r}")
         return
     spec = json.loads(version_row["spec_json"])
     rows = conn.execute(
-        "SELECT rr.partition_id, rr.offset, rr.status, rr.result_json, "
-        "rr.error_json, r.source_json FROM rule_results rr "
-        "JOIN records r ON r.partition_id=rr.partition_id "
-        "AND r.offset=rr.offset WHERE rr.version_id=? "
-        "ORDER BY rr.partition_id, rr.offset", (vid,))
+        "SELECT partition_id, offset, status, result_json, error_json, "
+        "source_revision FROM rule_results WHERE version_id=? "
+        "ORDER BY partition_id, offset", (vid,))
     for row in rows:
-        source = json.loads(row["source_json"])
+        pos = (row["partition_id"], row["offset"])
+        rev = row["source_revision"]
+        source = effective.get(pos, {}).get(rev)
+        if source is None:
+            problems.append(
+                f"p{pos[0]} o{pos[1]} version {vid}: result references "
+                f"unknown source revision {rev}")
+            continue
         status, payload = ref_outcome(spec, source)
         if status != row["status"]:
             problems.append(
-                f"p{row['partition_id']} o{row['offset']} version {vid}: "
+                f"p{pos[0]} o{pos[1]} version {vid} rev {rev}: "
                 f"status {row['status']} != reference {status}")
             continue
         if status == "ok":
             if payload != row["result_json"]:
                 problems.append(
-                    f"p{row['partition_id']} o{row['offset']} version {vid}: "
+                    f"p{pos[0]} o{pos[1]} version {vid} rev {rev}: "
                     f"value {row['result_json']!r} != reference {payload!r}")
         else:
             err = json.loads(row["error_json"])
@@ -176,10 +295,82 @@ def verify_version(conn, version_row, problems):
                     not _reason_matches(err.get("reason", ""),
                                         payload.reason_key)):
                 problems.append(
-                    f"p{row['partition_id']} o{row['offset']} version {vid}: "
+                    f"p{pos[0]} o{pos[1]} version {vid} rev {rev}: "
                     f"diagnostic {err} != reference "
                     f"field={payload.field} op={payload.op} "
                     f"key={payload.reason_key}")
+
+
+def verify_corrections(conn, problems):
+    """Audit the correction log's integrity without trusting the workflow."""
+    # the global sequence counts exactly the appended revisions
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='correction_seq'").fetchone()
+    seq = int(row[0]) if row else 0
+    total = conn.execute("SELECT COUNT(*) c FROM source_corrections").fetchone()["c"]
+    if seq != total:
+        problems.append(
+            f"correction_seq {seq} != number of revisions {total}")
+
+    # per-position chains: contiguous from 1, linked prev->new, pointer in
+    # correction_state equals the head revision
+    positions = [tuple(r) for r in conn.execute(
+        "SELECT DISTINCT partition_id, offset FROM source_corrections")]
+    covered = set()
+    for pid, off in positions:
+        chain = list(conn.execute(
+            "SELECT * FROM source_corrections WHERE partition_id=? AND "
+            "offset=? ORDER BY revision", (pid, off)))
+        covered.add((pid, off))
+        revs = [r["revision"] for r in chain]
+        if revs != list(range(1, len(chain) + 1)):
+            problems.append(
+                f"p{pid} o{off}: revision chain not contiguous: {revs}")
+            continue
+        original = conn.execute(
+            "SELECT source_json FROM records WHERE partition_id=? AND offset=?",
+            (pid, off)).fetchone()
+        if original is None:
+            problems.append(f"p{pid} o{off}: correction without committed record")
+            continue
+        prev_obj = json.loads(original["source_json"])
+        for r in chain:
+            if json.loads(r["prev_json"]) != prev_obj:
+                problems.append(
+                    f"p{pid} o{off} rev {r['revision']}: prev_json does not "
+                    f"match the previous effective object")
+            prev_obj = json.loads(r["new_json"])
+            prop = conn.execute(
+                "SELECT state FROM correction_proposals WHERE correction_id=?",
+                (r["correction_id"],)).fetchone()
+            if prop is None or prop["state"] != "applied":
+                problems.append(
+                    f"p{pid} o{off} rev {r['revision']}: correction_id "
+                    f"{r['correction_id']!r} is not an applied proposal")
+        pointer = conn.execute(
+            "SELECT revision FROM correction_state WHERE partition_id=? "
+            "AND offset=?", (pid, off)).fetchone()
+        if pointer is None or pointer["revision"] != len(chain):
+            problems.append(
+                f"p{pid} o{off}: correction_state pointer "
+                f"{None if pointer is None else pointer['revision']} != head "
+                f"revision {len(chain)}")
+
+    # no dangling pointers, and no applied proposal without its revision
+    for r in conn.execute("SELECT partition_id, offset FROM correction_state"):
+        if (r["partition_id"], r["offset"]) not in covered:
+            problems.append(
+                f"p{r['partition_id']} o{r['offset']}: correction_state "
+                "without any revision")
+    for r in conn.execute(
+            "SELECT correction_id, partition_id, offset, new_json FROM "
+            "correction_proposals WHERE state='applied'"):
+        rev = conn.execute(
+            "SELECT 1 FROM source_corrections WHERE correction_id=?",
+            (r["correction_id"],)).fetchone()
+        if rev is None:
+            problems.append(
+                f"applied proposal {r['correction_id']!r} has no revision row")
 
 
 def verify_database(db_path):
@@ -188,16 +379,19 @@ def verify_database(db_path):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     problems = []
+    effective = _effective_objects(conn)
     versions = list(conn.execute("SELECT * FROM rule_versions"))
     stats = {}
     for v in versions:
-        verify_version(conn, v, problems)
+        verify_version(conn, v, problems, effective)
         counts = {"ok": 0, "rejected": 0}
         for r in conn.execute(
             "SELECT status, COUNT(*) c FROM rule_results WHERE version_id=? "
             "GROUP BY status", (v["version_id"],)):
             counts[r["status"]] = r["c"]
         stats[v["version_id"]] = counts
+
+    verify_corrections(conn, problems)
 
     # active version covers every committed position with exactly one outcome
     state = conn.execute("SELECT * FROM rule_state WHERE id=1").fetchone()
@@ -217,6 +411,30 @@ def verify_database(db_path):
             problems.append(
                 f"active version {active}: p{pid} has {n_total} outcomes for "
                 f"{last + 1} committed positions (hole or extra row)")
+
+    # the active version must be current at every corrected position, and no
+    # result may reference a revision newer than the position's head
+    for r in conn.execute("SELECT * FROM correction_state"):
+        pid, off, rev = r["partition_id"], r["offset"], r["revision"]
+        res = conn.execute(
+            "SELECT source_revision FROM rule_results WHERE version_id=? "
+            "AND partition_id=? AND offset=?", (active, pid, off)).fetchone()
+        if res is None:
+            problems.append(
+                f"active version {active}: no result at corrected p{pid} o{off}")
+        elif res["source_revision"] != rev:
+            problems.append(
+                f"active version {active}: stale result at p{pid} o{off} "
+                f"(source_revision {res['source_revision']} != current {rev})")
+    for r in conn.execute(
+            "SELECT cs.partition_id, cs.offset, cs.revision, rr.version_id, "
+            "rr.source_revision FROM correction_state cs JOIN rule_results rr "
+            "ON rr.partition_id=cs.partition_id AND rr.offset=cs.offset "
+            "WHERE rr.source_revision > cs.revision"):
+        problems.append(
+            f"version {r['version_id']} at p{r['partition_id']} "
+            f"o{r['offset']}: result from future revision "
+            f"{r['source_revision']} > head {r['revision']}")
 
     # per-partition progress continuity against records
     for p in conn.execute("SELECT DISTINCT partition_id FROM records "

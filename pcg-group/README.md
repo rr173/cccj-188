@@ -85,12 +85,17 @@ terms.
 
 ```
 src/pcg/            coordinator, worker, admin, inspect, sink, planner, clock, source, clean
+src/pcg/rule_*.py   versioned cleaning-rule engine, store, recompute, review, export, CLI
+docs/rules.md       full rule-publishing contract, CLI and upgrade guide
 tools/gensource.py  generate an immutable JSONL source (never committed)
 tools/reconcile.py  independent reference audit (re-reads source, recomputes values)
 tools/demo.sh       one-command reproducible terminal demo
+tools/demo_rules.sh one-command demo of the rule publishing workflow
 tools/soak.py       small-memory long-run with membership churn + reconciliation
-tools/run_tests.sh  full automated test suite
+tools/run_tests.sh  full automated test suite (collection/handoff)
+tools/run_rule_tests.sh  acceptance suite for rule publishing (real processes)
 tests/              real multi-process end-to-end tests
+tests/tools_rule_ref.py independent reference rule evaluator (no production cleaner imports)
 ```
 
 ## Quick start
@@ -130,6 +135,48 @@ cleaned that batch but before the commit transaction it blocks in
 `barrier_events` until `admin barrier-release <name>`. This is what the
 headline test uses to prove a fully-computed, uncommitted batch is rejected
 after ownership moves.
+
+## Cleaning-rule publishing (versioned, online)
+
+Operators can change the cleaning calibre without stopping workers, clearing
+the sink or re-reading JSONL. The fixed cleaner stays available as the
+non-overwritable built-in `legacy` version; the first upgrade of any database
+selects it and copies historical `clean_json` verbatim into the versioned
+result table, so legacy reads are byte-identical to the old values. Full
+contract and diagnostics: [`docs/rules.md`](docs/rules.md).
+
+```bash
+python -m pcg --db g.db rule register v1 ./v1.json          # content-addressed
+python -m pcg --db g.db rule recompute v1 --page-size 200   # resumable, paged
+python -m pcg --db g.db rule status
+python -m pcg --db g.db rule review v1 --json               # -> review token
+python -m pcg --db g.db rule diff <token>                   # streamed findings
+python -m pcg --db g.db rule activate <token>               # atomic switch
+python -m pcg --db g.db rule export --json                  # official read
+```
+
+Safety properties, all covered by real-process acceptance tests:
+
+* rules are a small **declarative** contract (NFKC/strip/collapse/case,
+  exact-map alias, exact `decimal` with `HALF_EVEN`/`HALF_UP`); no user code;
+* recompute reads only committed `source_json`, pages results + watermarks in
+  short transactions, resumes after a real SIGKILL, never loads full history
+  into memory and never blocks ingestion with a long write transaction;
+* a review token pins the offset vector, active version and publish sequence;
+  new commits, a switch-away-and-back, or any candidate rejection/hole make it
+  unusable so activation is refused and the operator must review again;
+* the active version is chosen **inside** the worker's fenced commit, so a
+  batch computed before a switch commits under the new calibre; failed rows
+  keep raw data + progress and appear as explicit `REJECTED` exports;
+* an export takes one consistent section — a concurrent publish can never
+  produce a half-old/half-new stream or drop a covered position;
+* rollback is recompute → review → activate as well, so an old version cannot
+  be pointed at while missing rows it never processed.
+
+Run it end to end with `./tools/demo_rules.sh` and the acceptance suite with
+`./tools/run_rule_tests.sh` (30 scenarios, including bounded-memory catch-up
+on skewed partitions and an independent reference evaluator that imports none
+of the production cleaning code).
 
 ## What the tests prove (real processes, not mocks)
 

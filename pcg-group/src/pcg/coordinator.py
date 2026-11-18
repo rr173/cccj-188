@@ -127,11 +127,26 @@ class Coordinator:
 
     def tick(self) -> None:
         """One deterministic coordination pass (also used directly by tests)."""
+        self._register_partitions()
         self._expire_dead_members()
         self._maybe_create_plan()
         self._process_acks()
         self._process_revocations()
         self._finalize_ready_plans()
+
+    def _register_partitions(self) -> None:
+        """Keep the partition catalog current so empty partitions (no rows and
+        no progress yet) still appear in review/export offset vectors as -1."""
+        try:
+            partitions = list_partitions(self.source_dir)
+        except Exception:
+            return
+        now = self.clock.now_ms()
+        with tx(self.conn):
+            for pid in partitions:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO partitions(partition_id,first_seen_at)"
+                    " VALUES(?,?)", (pid, now))
 
     # ------------------------------------------------------------------ members
     def _expire_dead_members(self) -> None:

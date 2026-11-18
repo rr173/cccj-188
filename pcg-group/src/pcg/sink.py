@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .db import tx
+from .rule_store import build_outcome, get_active, load_version, parse_source
 
 
 class CommitRejected(Exception):
@@ -130,6 +131,22 @@ def commit_batch(conn: sqlite3.Connection, clock, *, partition: int, gen: int,
             fail(f"offset {overlap['offset']} already committed (late duplicate batch)",
                  plan_id)
 
+        # The active rule version is selected *inside* this fence transaction,
+        # so a batch that was computed before a switch but commits afterwards
+        # can never masquerade old-calibre values under the new version: its
+        # rule outcome is (re)computed here against whatever version is active
+        # at commit time. Source rows + progress + versioned outcomes therefore
+        # land atomically; a rule rejection keeps the raw row and progress and
+        # stores an explicit diagnostic instead of silently dropping the row.
+        rule_state = get_active(conn)
+        active_version_id = rule_state["active_version"]
+        active_version = load_version(conn, active_version_id)
+        rule_outcomes = []
+        for it in items:
+            src_obj = parse_source(it.source_raw)
+            status, payload = build_outcome(active_version, src_obj)
+            rule_outcomes.append((it.offset, status, payload))
+
         for it in items:
             conn.execute(
                 "INSERT INTO records(partition_id,offset,gen,worker_id,source_json,"
@@ -138,6 +155,30 @@ def commit_batch(conn: sqlite3.Connection, clock, *, partition: int, gen: int,
                  json.dumps(it.clean_value, sort_keys=True, separators=(",", ":"),
                             ensure_ascii=False), now),
             )
+        for offset, status, payload in rule_outcomes:
+            if status == "ok":
+                conn.execute(
+                    "INSERT INTO rule_results(version_id,partition_id,offset,"
+                    "status,result_json,error_json,computed_at) "
+                    "VALUES(?,?,?,'ok',?,NULL,?)",
+                    (active_version_id, partition, offset, payload, now),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO rule_results(version_id,partition_id,offset,"
+                    "status,result_json,error_json,computed_at) "
+                    "VALUES(?,?,?,'rejected',NULL,?,?)",
+                    (active_version_id, partition, offset,
+                     json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                                ensure_ascii=False), now),
+                )
+        # the backfill watermark of the active version advances with progress,
+        # so a later recompute resumes exactly after these committed rows
+        conn.execute(
+            "INSERT OR REPLACE INTO rule_recompute_progress(version_id,partition_id,"
+            "done_offset,updated_at) VALUES(?,?,?,?)",
+            (active_version_id, partition, end, now),
+        )
         conn.execute(
             "INSERT INTO progress(partition_id,committed_offset,gen,worker_id,updated_at)"
             " VALUES(?,?,?,?,?) ON CONFLICT(partition_id) DO UPDATE SET "

@@ -6,6 +6,7 @@ data/*
 *.db-wal
 *.db-shm
 *.coordlock
+*.recomputelock
 
 # Python
 __pycache__/

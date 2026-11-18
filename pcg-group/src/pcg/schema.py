@@ -142,4 +142,100 @@ CREATE TABLE IF NOT EXISTS barrier_events(
 
 CREATE INDEX IF NOT EXISTS idx_assign_worker ON assignments(worker_id);
 CREATE INDEX IF NOT EXISTS idx_records_po ON records(partition_id, offset);
+
+-- ===========================================================================
+-- Versioned cleaning-rule publishing (see docs/rules.md and pcg.rule_*).
+--
+-- The tables above (records.clean_json, progress, ...) stay byte-for-byte
+-- unchanged.  Rule-publishing adds:
+--   * a version registry (rule_versions), with the fixed cleaner registered as
+--     the non-overwritable built-in 'legacy' version;
+--   * versioned per-position results / rejection diagnostics (rule_results);
+--   * durable backfill watermarks (rule_recompute_progress);
+--   * a singleton active-version pointer + monotonic publish sequence
+--     (rule_state, rule_publishes);
+--   * persisted review tokens (rule_reviews).
+-- Every migration statement is idempotent so upgrading an empty or a populated
+-- database can be repeated safely.
+-- ===========================================================================
+
+-- partition catalog (also materialises "empty partition => offset -1" vectors)
+CREATE TABLE IF NOT EXISTS partitions(
+  partition_id   INTEGER PRIMARY KEY,
+  first_seen_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rule_versions(
+  version_id   TEXT PRIMARY KEY,
+  spec_json    TEXT NOT NULL,      -- canonical JSON: sorted keys, compact
+  spec_sha256  TEXT NOT NULL,
+  builtin      INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rule_state(
+  id             INTEGER PRIMARY KEY CHECK(id = 1),
+  active_version TEXT NOT NULL,
+  publish_seq    INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  FOREIGN KEY(active_version) REFERENCES rule_versions(version_id)
+);
+
+CREATE TABLE IF NOT EXISTS rule_publishes(
+  seq        INTEGER PRIMARY KEY,
+  version_id TEXT NOT NULL,
+  at_ms      INTEGER NOT NULL,
+  reason     TEXT NOT NULL
+);
+
+-- exactly one outcome per (version, source position): a full result or an
+-- explicit rejection; a missing row means "not covered yet", never "same".
+CREATE TABLE IF NOT EXISTS rule_results(
+  version_id   TEXT NOT NULL,
+  partition_id INTEGER NOT NULL,
+  offset       INTEGER NOT NULL,
+  status       TEXT NOT NULL CHECK(status IN ('ok','rejected')),
+  result_json  TEXT,              -- iff status='ok'
+  error_json   TEXT,              -- iff status='rejected'
+  computed_at  INTEGER NOT NULL,
+  PRIMARY KEY(version_id, partition_id, offset)
+) WITHOUT ROWID;
+
+-- durable backfill watermark per (version, partition); a restarted recompute
+-- resumes at done_offset+1 instead of rescanning/recomputing finished history.
+CREATE TABLE IF NOT EXISTS rule_recompute_progress(
+  version_id   TEXT NOT NULL,
+  partition_id INTEGER NOT NULL,
+  done_offset  INTEGER NOT NULL,  -- last covered offset; -1 when none
+  updated_at   INTEGER NOT NULL,
+  PRIMARY KEY(version_id, partition_id)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS rule_reviews(
+  token              TEXT PRIMARY KEY,
+  version_id         TEXT NOT NULL,
+  base_version       TEXT NOT NULL,
+  spec_sha256        TEXT NOT NULL,
+  offset_vector_json TEXT NOT NULL,   -- {"<partition>": last_offset, ...}, -1 empty
+  publish_seq        INTEGER NOT NULL,
+  stats_json         TEXT NOT NULL,
+  created_at         INTEGER NOT NULL
+);
+
+-- materialised, immutable per-position findings of a review. Later ingestion
+-- or recomputation can never silently change what the review represented.
+CREATE TABLE IF NOT EXISTS rule_review_items(
+  token        TEXT NOT NULL,
+  partition_id INTEGER NOT NULL,
+  offset       INTEGER NOT NULL,
+  kind         TEXT NOT NULL,  -- changed | candidate_rejected | uncovered |
+                               -- base_rejected_candidate_ok
+  detail_json  TEXT NOT NULL,
+  PRIMARY KEY(token, partition_id, offset)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_rule_results_po
+  ON rule_results(partition_id, offset);
+CREATE INDEX IF NOT EXISTS idx_rule_rcp_version
+  ON rule_recompute_progress(version_id);
 """

@@ -16,7 +16,20 @@ def connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=15, isolation_level=None,
                            check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # PRAGMA journal_mode does not honour busy_timeout the way ordinary
+    # statements do, so two processes creating/opening the database at the
+    # same instant can raise "database is locked". Management commands and
+    # workers legitimately open the DB concurrently, so retry the mode change
+    # briefly instead of failing a process on a startup race.
+    import time
+    for attempt in range(30):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or attempt == 29:
+                raise
+            time.sleep(0.1)
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=15000")
@@ -24,11 +37,23 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 
 def init_db(db_path: str) -> None:
-    """Create schema (idempotent). Safe to run from every command."""
+    """Create schema and run rule-publishing upgrade (idempotent).
+
+    Safe to run from every command and on both empty and populated databases;
+    repeating it never changes an already-upgraded database.
+    """
+    import time
+
+    from .rule_store import rule_migrate
+
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        # rule-publishing upgrade (built-in 'legacy' version + backfill),
+        # in short transactions so a populated database never blocks writers
+        # for the whole history.
+        rule_migrate(conn, int(time.time() * 1000))
     finally:
         conn.close()
 

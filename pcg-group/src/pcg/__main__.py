@@ -69,6 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     i = sub.add_parser("inspect", help="read-only state dump")
     _add_common(i)
     i.add_argument("--json", action="store_true")
+
+    from .rule_cli import add_rule_parser
+    add_rule_parser(sub)
     return p
 
 
@@ -124,8 +127,22 @@ def main(argv: list[str] | None = None) -> int:
         inspect(args.db, clock_mode=args.clock, as_json=args.json)
         return 0
 
+    if args.cmd == "rule":
+        return args.rule_fn(args.db, args.clock, args)
+
     return 2
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # downstream consumer (e.g. `| head`) closed the pipe; finish quietly
+        # instead of dumping a traceback
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
